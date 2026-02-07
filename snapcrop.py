@@ -2,11 +2,83 @@
 # 说明：本项目在 GPT 的协助下完成（部分功能思路与代码结构由 GPT 提供建议）。
 
 import os
+import math
 import secrets  # 用于生成更可靠的随机数（这里用来做 4 位随机后缀）
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk, ImageOps, ImageEnhance
+
+
+class ScrollableFrame(ttk.Frame):
+    """
+    Notebook 的每个 Tab 用这个包一层：
+    - 内容超高自动滚动
+    - 鼠标滚轮在该区域内生效
+    """
+    def __init__(self, master, *, bg=None, **kwargs):
+        super().__init__(master, **kwargs)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+
+        self.inner = ttk.Frame(self)
+
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # 鼠标滚轮：进入区域才滚
+        self.canvas.bind("<Enter>", lambda e: self._bind_mousewheel(True))
+        self.canvas.bind("<Leave>", lambda e: self._bind_mousewheel(False))
+
+        if bg is not None:
+            try:
+                self.canvas.configure(bg=bg)
+            except Exception:
+                pass
+
+    def _on_inner_configure(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event=None):
+        # 让 inner 宽度跟随 canvas
+        try:
+            self.canvas.itemconfigure(self._win, width=max(1, self.canvas.winfo_width()))
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event):
+        # Windows: event.delta
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 if event.delta > 0 else 1
+        else:
+            return
+        self.canvas.yview_scroll(delta * 3, "units")
+        return "break"
+
+    def _on_mousewheel_linux(self, event):
+        if event.num == 4:
+            self.canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(3, "units")
+        return "break"
+
+    def _bind_mousewheel(self, bind: bool):
+        w = self.winfo_toplevel()
+        if bind:
+            w.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+            w.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
+            w.bind_all("<Button-5>", self._on_mousewheel_linux, add="+")
+        else:
+            # 不强制解绑 all，避免影响别的区域；这里做一个轻量保护：只有进入才滚
+            pass
 
 
 class SnapCrop:
@@ -20,6 +92,25 @@ class SnapCrop:
     # ====== 项目信息 ======
     GITHUB_URL = "https://github.com/xuanyuanwenzhi/snapcrop"
     INFO_TAB_TITLE = "详情"
+
+    # ====== 常见比例候选（用于“最接近比例”）======
+    COMMON_RATIOS = [
+        (1, 1),
+        (2, 1), (3, 1), (4, 1), (5, 1),
+        (1, 2), (1, 3), (1, 4), (1, 5),
+        (3, 2), (2, 3),
+        (4, 3), (3, 4),
+        (5, 4), (4, 5),
+        (5, 3), (3, 5),
+        (16, 9), (9, 16),
+        (21, 9), (9, 21),
+        (7, 4), (4, 7),
+        (8, 5), (5, 8),
+        (6, 5), (5, 6),
+        (7, 3), (3, 7),
+        (8, 3), (3, 8),
+        (10, 9), (9, 10),
+    ]
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -74,11 +165,34 @@ class SnapCrop:
         self._rot_chain_total_deg = 0.0  # 累计角度
         self._last_op = None             # "rotate" or others
 
+        # ====== 分片拉伸（UI 状态）======
+        self.pw_dir = tk.StringVar(value="横向（保护左右）")
+        self.pw_link_other = tk.BooleanVar(value=False)  # 横向/纵向分片时：另一维是否普通缩放
+        self.pw_unit = tk.StringVar(value="百分比(%)")   # 分片拉伸单位（% / px）
+        self._pw_guide_ids = []                          # 分片拉伸预览线（Canvas ids）
+        self._pw_guides_state = None                     # {"mode":..., "xa":..., "xb":..., "ya":..., "yb":...} in image px
+
+        # ====== 调色（UI 状态）======
+        self.var_brightness = tk.DoubleVar(value=1.0)  # 亮度系数：<1 变暗，>1 变亮
+        self.var_white = tk.IntVar(value=0)            # 向白靠近强度（0~100）
+        self.var_black = tk.IntVar(value=0)            # 向黑靠近强度（0~100）
+
+        # ====== 裁剪分析（UI 状态）======
+        self.crop_ratio_view_mode = tk.StringVar(value="常见比例")  # "常见比例" / "小数(小边=1)"
+
+        # ====== 浮窗：裁剪比例/分析 ======
+        self.ratio_win = None
+        self._ratio_win_visible = False
+
         # ====== UI ======
         self._build_style()
         self._build_layout()
         self._bind_shortcuts()
         self._set_ui_enabled(False)
+
+        # 主窗回到前台时，浮窗跟随浮上来（不做全局置顶）
+        self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
+        self.root.bind("<Map>", self._on_root_focus_in, add="+")
 
     # =========================
     # UI
@@ -155,35 +269,49 @@ class SnapCrop:
         self.btn_clear_crop = ttk.Button(self.toolbar, text="清除裁剪 (Esc)", style="Tool.TButton", command=self.clear_crop)
         self.btn_clear_crop.pack(side=tk.LEFT, padx=6)
 
-        # 主体：左面板 + 右 canvas
+        ttk.Separator(self.toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.btn_ratio_panel = ttk.Button(
+            self.toolbar, text="裁剪面板 (F4)", style="Tool.TButton", command=self.toggle_ratio_window
+        )
+        self.btn_ratio_panel.pack(side=tk.LEFT, padx=6)
+
+        # 主体：左面板 + 右 canvas（用 PanedWindow 可拉伸）
         self.main = ttk.Frame(root, style="App.TFrame")
         self.main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        self.left = ttk.Frame(self.main, style="Panel.TFrame", width=360)
-        self.left.pack(side=tk.LEFT, fill=tk.Y)
+        self.paned = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True)
+
+        self.left = ttk.Frame(self.paned, style="Panel.TFrame", width=360)
+        self.right = ttk.Frame(self.paned, style="Panel.TFrame")
+
+        self.paned.add(self.left, weight=0)   # 左侧固定偏重（但可拖动）
+        self.paned.add(self.right, weight=1)
+
         self.left.pack_propagate(False)
 
-        self.right = ttk.Frame(self.main, style="Panel.TFrame")
-        self.right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-
-        # 左：Notebook
+        # 左：Notebook（每个 tab 可滚动）
         self.nb = ttk.Notebook(self.left)
         self.nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.tab_transform = ttk.Frame(self.nb, style="Panel.TFrame")
-        self.tab_crop = ttk.Frame(self.nb, style="Panel.TFrame")
-        self.tab_split = ttk.Frame(self.nb, style="Panel.TFrame")
-        self.tab_ops = ttk.Frame(self.nb, style="Panel.TFrame")
-        self.tab_info = ttk.Frame(self.nb, style="Panel.TFrame")  # 新增：详情/代码页
+        self.tab_transform = ScrollableFrame(self.nb, bg=self.PANEL)
+        self.tab_crop = ScrollableFrame(self.nb, bg=self.PANEL)
+        self.tab_split = ScrollableFrame(self.nb, bg=self.PANEL)
+        self.tab_adjust = ScrollableFrame(self.nb, bg=self.PANEL)
+        self.tab_ops = ScrollableFrame(self.nb, bg=self.PANEL)
+        self.tab_info = ScrollableFrame(self.nb, bg=self.PANEL)
 
         self.nb.add(self.tab_transform, text="缩放")
         self.nb.add(self.tab_crop, text="裁剪")
         self.nb.add(self.tab_ops, text="变换")
         self.nb.add(self.tab_split, text="分割")
-        self.nb.add(self.tab_info, text=self.INFO_TAB_TITLE)  # 你想叫“代码”就改 INFO_TAB_TITLE
+        self.nb.add(self.tab_adjust, text="调色")
+        self.nb.add(self.tab_info, text=self.INFO_TAB_TITLE)
 
+        # 下面开始：把你原来所有 “self.tab_xxx” 当 parent 的地方，改成 “self.tab_xxx.inner”
         # ---- Transform ----
-        lf = ttk.Labelframe(self.tab_transform, text="缩放 / 拉伸")
+        lf = ttk.Labelframe(self.tab_transform.inner, text="缩放 / 拉伸")
         lf.pack(fill=tk.X, padx=10, pady=10)
 
         row = ttk.Frame(lf)
@@ -205,33 +333,101 @@ class SnapCrop:
         self.btn_apply_stretch = ttk.Button(row2, text="自由拉伸", command=self.apply_stretch, style="Tool.TButton")
         self.btn_apply_stretch.pack(side=tk.LEFT)
 
-        # ---- Crop ----
-        lf_ratio = ttk.Labelframe(self.tab_crop, text="裁剪比例")
-        lf_ratio.pack(fill=tk.X, padx=10, pady=(10, 6))
+        # ---- Piecewise Stretch ----
+        lf_pw = ttk.Labelframe(self.tab_transform.inner, text="分片拉伸（保护边缘/圆角）")
+        lf_pw.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        rowr = ttk.Frame(lf_ratio)
-        rowr.pack(fill=tk.X, pady=8, padx=8)
-
-        ttk.Label(rowr, text="固定比例").pack(side=tk.LEFT)
-        self.aspect_mode = tk.StringVar(value="自由")
-        self.combo_aspect = ttk.Combobox(
-            rowr, textvariable=self.aspect_mode, state="readonly", width=14,
-            values=("自由", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "自定义")
+        rowpw1 = ttk.Frame(lf_pw)
+        rowpw1.pack(fill=tk.X, padx=8, pady=(10, 6))
+        ttk.Label(rowpw1, text="方向").pack(side=tk.LEFT)
+        self.combo_pw_dir = ttk.Combobox(
+            rowpw1, textvariable=self.pw_dir, state="readonly", width=18,
+            values=("横向（保护左右）", "纵向（保护上下）", "双向（九宫格）")
         )
-        self.combo_aspect.pack(side=tk.LEFT, padx=(8, 8))
-        self.combo_aspect.bind("<<ComboboxSelected>>", self._on_aspect_mode)
+        self.combo_pw_dir.pack(side=tk.LEFT, padx=(8, 8))
 
-        self.aspect_custom_frame = ttk.Frame(lf_ratio)
-        self.ent_aspect_w = ttk.Entry(self.aspect_custom_frame, width=6)
-        self.ent_aspect_h = ttk.Entry(self.aspect_custom_frame, width=6)
-        ttk.Label(self.aspect_custom_frame, text="W").pack(side=tk.LEFT)
-        self.ent_aspect_w.pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Label(self.aspect_custom_frame, text="H").pack(side=tk.LEFT)
-        self.ent_aspect_h.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(rowpw1, text="单位").pack(side=tk.LEFT, padx=(8, 0))
+        self.combo_pw_unit = ttk.Combobox(
+            rowpw1, textvariable=self.pw_unit, state="readonly", width=10,
+            values=("百分比(%)", "像素(px)")
+        )
+        self.combo_pw_unit.pack(side=tk.LEFT, padx=(8, 8))
+        self.combo_pw_unit.bind("<<ComboboxSelected>>", self._on_pw_unit_change)
+
+        self.chk_pw_link = ttk.Checkbutton(
+            rowpw1, text="双向（普通缩放）", variable=self.pw_link_other
+        )
+        self.chk_pw_link.pack(side=tk.LEFT)
+
+        # 横向范围（百分比/像素）
+        rowpw2 = ttk.Frame(lf_pw)
+        rowpw2.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.lbl_pw_x = ttk.Label(rowpw2, text="横向拉伸区域(%)")
+        self.lbl_pw_x.pack(side=tk.LEFT)
+        self.ent_pw_x1 = ttk.Entry(rowpw2, width=6)
+        self.ent_pw_x2 = ttk.Entry(rowpw2, width=6)
+        self.ent_pw_x1.pack(side=tk.LEFT, padx=(8, 6))
+        ttk.Label(rowpw2, text="~").pack(side=tk.LEFT)
+        self.ent_pw_x2.pack(side=tk.LEFT, padx=(6, 0))
+        self.ent_pw_x1.insert(0, "20")
+        self.ent_pw_x2.insert(0, "80")
+
+        # 纵向范围（百分比/像素）
+        rowpw3 = ttk.Frame(lf_pw)
+        rowpw3.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.lbl_pw_y = ttk.Label(rowpw3, text="纵向拉伸区域(%)")
+        self.lbl_pw_y.pack(side=tk.LEFT)
+        self.ent_pw_y1 = ttk.Entry(rowpw3, width=6)
+        self.ent_pw_y2 = ttk.Entry(rowpw3, width=6)
+        self.ent_pw_y1.pack(side=tk.LEFT, padx=(8, 6))
+        ttk.Label(rowpw3, text="~").pack(side=tk.LEFT)
+        self.ent_pw_y2.pack(side=tk.LEFT, padx=(6, 0))
+        self.ent_pw_y1.insert(0, "20")
+        self.ent_pw_y2.insert(0, "80")
 
         ttk.Label(
-            self.tab_crop,
-            text="比例手感（已优化）：\n"
+            lf_pw,
+            text="说明：\n"
+                 "- 横向：左右边缘保持不变形，仅拉伸中间区域（常用于圆角框）\n"
+                 "- 纵向：上下边缘保持不变形，仅拉伸中间区域\n"
+                 "- 双向：九宫格拉伸（角不变、边单轴拉伸、中间双轴拉伸）\n"
+                 "- 横向/纵向模式下：默认只改一个方向；勾选“同时调整另一边”才会把另一维用普通缩放改到目标尺寸\n"
+                 "- 预览：横/纵显示 2 条虚线；双向显示 4 条虚线\n",
+            justify=tk.LEFT
+        ).pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        rowpw_btn = ttk.Frame(lf_pw)
+        rowpw_btn.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.btn_piecewise_preview = ttk.Button(
+            rowpw_btn, text="预览分割线", command=self.preview_piecewise_guides, style="Tool.TButton"
+        )
+        self.btn_piecewise_preview.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_piecewise_clear_preview = ttk.Button(
+            rowpw_btn, text="清除预览", command=self.clear_piecewise_guides, style="Tool.TButton"
+        )
+        self.btn_piecewise_clear_preview.pack(side=tk.LEFT)
+
+        self.btn_piecewise = ttk.Button(
+            lf_pw, text="应用分片拉伸", command=self.apply_piecewise_stretch, style="Accent.TButton"
+        )
+        self.btn_piecewise.pack(fill=tk.X, padx=8, pady=(0, 10))
+
+        # ---- Crop (tab) ----
+        # 裁剪页：给一个入口按钮（比例/分析在浮窗里）
+        lf_crop_entry = ttk.Labelframe(self.tab_crop.inner, text="裁剪面板（浮窗）")
+        lf_crop_entry.pack(fill=tk.X, padx=10, pady=(10, 6))
+        ttk.Label(
+            lf_crop_entry,
+            text="提示：比例设置 + 裁剪分析 已移到可拖动浮窗。\n按 F4 或点按钮打开。",
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, padx=8, pady=(8, 6))
+        ttk.Button(
+            lf_crop_entry, text="打开/隐藏裁剪面板 (F4)", command=self.toggle_ratio_window, style="Accent.TButton"
+        ).pack(fill=tk.X, padx=8, pady=(0, 10))
+
+        ttk.Label(
+            self.tab_crop.inner,
+            text="比例手感：\n"
                  "- 固定比例时，拖动边(N/S/E/W)默认“以中心对称缩放”（更像PS）\n"
                  "- Shift：自由模式下临时 1:1；已有框时临时保持当前比例\n"
                  "- Space：拖拽边/角时临时“移动裁剪框（保持尺寸）”（用于卡边时顺滑挪动）\n"
@@ -242,7 +438,7 @@ class SnapCrop:
             justify=tk.LEFT
         ).pack(fill=tk.X, padx=12, pady=(6, 10))
 
-        lf2 = ttk.Labelframe(self.tab_crop, text="边缘裁剪（px / %）")
+        lf2 = ttk.Labelframe(self.tab_crop.inner, text="边缘裁剪（px / %）")
         lf2.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         grid = ttk.Frame(lf2)
@@ -269,8 +465,26 @@ class SnapCrop:
         self.btn_apply_all = ttk.Button(row3, text="应用裁剪 + 缩放", command=self.apply_crop_and_resize, style="Accent.TButton")
         self.btn_apply_all.pack(side=tk.LEFT)
 
+        # ---- Crop by size ----
+        lf_sizecrop = ttk.Labelframe(self.tab_crop.inner, text="按尺寸生成裁剪框（px）")
+        lf_sizecrop.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        rowsc = ttk.Frame(lf_sizecrop)
+        rowsc.pack(fill=tk.X, padx=8, pady=(10, 6))
+        ttk.Label(rowsc, text="宽").pack(side=tk.LEFT)
+        self.ent_crop_w = ttk.Entry(rowsc, width=10)
+        self.ent_crop_w.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(rowsc, text="高").pack(side=tk.LEFT)
+        self.ent_crop_h = ttk.Entry(rowsc, width=10)
+        self.ent_crop_h.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.btn_crop_by_size = ttk.Button(
+            lf_sizecrop, text="生成居中裁剪框", command=self.crop_box_by_size_preview, style="Accent.TButton"
+        )
+        self.btn_crop_by_size.pack(fill=tk.X, padx=8, pady=(0, 10))
+
         # ---- Ops (Rotate/Flip/Canvas/Trim) ----
-        lf_rot = ttk.Labelframe(self.tab_ops, text="旋转")
+        lf_rot = ttk.Labelframe(self.tab_ops.inner, text="旋转")
         lf_rot.pack(fill=tk.X, padx=10, pady=(10, 8))
 
         rowrot = ttk.Frame(lf_rot)
@@ -291,7 +505,7 @@ class SnapCrop:
         self.btn_rot_180 = ttk.Button(rowrot, text="180°", command=lambda: self.rotate_quick(180), style="Tool.TButton")
         self.btn_rot_180.pack(side=tk.LEFT)
 
-        lf_flip = ttk.Labelframe(self.tab_ops, text="翻转")
+        lf_flip = ttk.Labelframe(self.tab_ops.inner, text="翻转")
         lf_flip.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         rowf = ttk.Frame(lf_flip)
@@ -302,7 +516,7 @@ class SnapCrop:
         self.btn_flip_v.pack(side=tk.LEFT)
 
         # ---- Canvas Expand ----
-        lf_canvas = ttk.Labelframe(self.tab_ops, text="画布扩展（Padding px）")
+        lf_canvas = ttk.Labelframe(self.tab_ops.inner, text="画布扩展（Padding px）")
         lf_canvas.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         grid2 = ttk.Frame(lf_canvas)
@@ -339,14 +553,14 @@ class SnapCrop:
         self.btn_expand = ttk.Button(lf_canvas, text="应用扩展画布", command=self.expand_canvas, style="Accent.TButton")
         self.btn_expand.pack(fill=tk.X, padx=8, pady=(0, 10))
 
-        lf_trim = ttk.Labelframe(self.tab_ops, text="自动修剪")
+        lf_trim = ttk.Labelframe(self.tab_ops.inner, text="自动修剪")
         lf_trim.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         self.btn_trim_alpha = ttk.Button(lf_trim, text="自动修剪透明边（Trim Alpha）", command=self.trim_transparent, style="Accent.TButton")
         self.btn_trim_alpha.pack(fill=tk.X, padx=8, pady=10)
 
         # ---- Split ----
-        lf3 = ttk.Labelframe(self.tab_split, text="等分分割")
+        lf3 = ttk.Labelframe(self.tab_split.inner, text="等分分割")
         lf3.pack(fill=tk.X, padx=10, pady=10)
 
         self.split_mode = tk.StringVar(value="4等分（2×2）")
@@ -367,6 +581,88 @@ class SnapCrop:
 
         self.btn_split = ttk.Button(lf3, text="执行分割并保存", command=self.split_image, style="Accent.TButton")
         self.btn_split.pack(fill=tk.X, padx=8, pady=(10, 10))
+
+        # ---- Adjust (Color) ----
+        lf_adj1 = ttk.Labelframe(self.tab_adjust.inner, text="亮度（不影响透明区域）")
+        lf_adj1.pack(fill=tk.X, padx=10, pady=(10, 8))
+
+        rowa = ttk.Frame(lf_adj1)
+        rowa.pack(fill=tk.X, padx=8, pady=(10, 6))
+        ttk.Label(rowa, text="亮度系数").pack(side=tk.LEFT)
+
+        self.scale_bri = ttk.Scale(rowa, from_=0.2, to=2.0, variable=self.var_brightness)
+        self.scale_bri.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+
+        self.lbl_bri = ttk.Label(rowa, text="1.00")
+        self.lbl_bri.pack(side=tk.RIGHT)
+
+        def _sync_bri_label(*_):
+            try:
+                self.lbl_bri.config(text=f"{float(self.var_brightness.get()):.2f}")
+            except Exception:
+                self.lbl_bri.config(text="1.00")
+
+        self.var_brightness.trace_add("write", _sync_bri_label)
+        _sync_bri_label()
+
+        rowa2 = ttk.Frame(lf_adj1)
+        rowa2.pack(fill=tk.X, padx=8, pady=(0, 10))
+        self.btn_apply_bri = ttk.Button(rowa2, text="应用亮度", command=self.apply_brightness, style="Accent.TButton")
+        self.btn_apply_bri.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_reset_bri = ttk.Button(rowa2, text="重置为 1.00", command=lambda: self.var_brightness.set(1.0), style="Tool.TButton")
+        self.btn_reset_bri.pack(side=tk.LEFT)
+
+        lf_adj2 = ttk.Labelframe(self.tab_adjust.inner, text="变白 / 变黑（混合，不影响透明区域）")
+        lf_adj2.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        roww = ttk.Frame(lf_adj2)
+        roww.pack(fill=tk.X, padx=8, pady=(10, 6))
+        ttk.Label(roww, text="变白强度").pack(side=tk.LEFT)
+        self.scale_white = ttk.Scale(roww, from_=0, to=100, variable=self.var_white)
+        self.scale_white.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.lbl_white = ttk.Label(roww, text="0%")
+        self.lbl_white.pack(side=tk.RIGHT)
+
+        def _sync_white_label(*_):
+            try:
+                self.lbl_white.config(text=f"{int(float(self.var_white.get()))}%")
+            except Exception:
+                self.lbl_white.config(text="0%")
+
+        self.var_white.trace_add("write", _sync_white_label)
+        _sync_white_label()
+
+        rowb = ttk.Frame(lf_adj2)
+        rowb.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Label(rowb, text="变黑强度").pack(side=tk.LEFT)
+        self.scale_black = ttk.Scale(rowb, from_=0, to=100, variable=self.var_black)
+        self.scale_black.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.lbl_black = ttk.Label(rowb, text="0%")
+        self.lbl_black.pack(side=tk.RIGHT)
+
+        def _sync_black_label(*_):
+            try:
+                self.lbl_black.config(text=f"{int(float(self.var_black.get()))}%")
+            except Exception:
+                self.lbl_black.config(text="0%")
+
+        self.var_black.trace_add("write", _sync_black_label)
+        _sync_black_label()
+
+        rowwb = ttk.Frame(lf_adj2)
+        rowwb.pack(fill=tk.X, padx=8, pady=(0, 10))
+        self.btn_apply_white = ttk.Button(rowwb, text="应用变白", command=self.apply_whiten, style="Accent.TButton")
+        self.btn_apply_white.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_apply_black = ttk.Button(rowwb, text="应用变黑", command=self.apply_blacken, style="Tool.TButton")
+        self.btn_apply_black.pack(side=tk.LEFT)
+
+        ttk.Label(
+            self.tab_adjust.inner,
+            text="提示：\n"
+                 "- 亮度：系数 < 1 变暗，> 1 变亮\n"
+                 "- 变白/变黑：把 RGB 向白/黑“混合靠近”，透明部分不受影响\n",
+            justify=tk.LEFT
+        ).pack(fill=tk.X, padx=12, pady=(0, 8))
 
         # ---- Info / Details ----
         self._build_info_tab()
@@ -403,8 +699,14 @@ class SnapCrop:
         # Canvas 绑定
         self._bind_canvas_events()
 
+        # 初始化单位显示（避免初始文本不一致）
+        self._on_pw_unit_change()
+
+        # 初始化裁剪分析（无裁剪框）
+        self._update_crop_analysis()
+
     def _build_info_tab(self):
-        lf = ttk.Labelframe(self.tab_info, text="项目 / Project")
+        lf = ttk.Labelframe(self.tab_info.inner, text="项目 / Project")
         lf.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         ttk.Label(
@@ -432,6 +734,192 @@ class SnapCrop:
             justify=tk.LEFT
         ).pack(anchor=tk.W, padx=10, pady=(0, 10))
 
+    # =========================
+    # 浮窗：裁剪比例 + 裁剪分析
+    # =========================
+    def _create_ratio_window_if_needed(self):
+        if self.ratio_win and self.ratio_win.winfo_exists():
+            return
+
+        win = tk.Toplevel(self.root)
+        self.ratio_win = win
+        win.title("裁剪面板（比例 / 分析）")
+        win.geometry("380x520")
+        win.minsize(320, 420)
+
+        # Windows：尽量不单独出任务栏
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+        try:
+            win.wm_attributes("-toolwindow", True)
+        except Exception:
+            pass
+
+        # 关闭按钮：改为隐藏
+        win.protocol("WM_DELETE_WINDOW", self.hide_ratio_window)
+
+        # 内容
+        container = ttk.Frame(win, style="Panel.TFrame")
+        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 裁剪比例
+        lf_ratio = ttk.Labelframe(container, text="裁剪比例")
+        lf_ratio.pack(fill=tk.X, padx=0, pady=(0, 10))
+
+        rowr = ttk.Frame(lf_ratio)
+        rowr.pack(fill=tk.X, pady=8, padx=8)
+
+        ttk.Label(rowr, text="固定比例").pack(side=tk.LEFT)
+        self.aspect_mode = tk.StringVar(value="自由")
+        self.combo_aspect = ttk.Combobox(
+            rowr, textvariable=self.aspect_mode, state="readonly", width=14,
+            values=("自由", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "自定义")
+        )
+        self.combo_aspect.pack(side=tk.LEFT, padx=(8, 8))
+        self.combo_aspect.bind("<<ComboboxSelected>>", self._on_aspect_mode)
+
+        self.aspect_custom_frame = ttk.Frame(lf_ratio)
+        self.ent_aspect_w = ttk.Entry(self.aspect_custom_frame, width=6)
+        self.ent_aspect_h = ttk.Entry(self.aspect_custom_frame, width=6)
+        ttk.Label(self.aspect_custom_frame, text="W").pack(side=tk.LEFT)
+        self.ent_aspect_w.pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(self.aspect_custom_frame, text="H").pack(side=tk.LEFT)
+        self.ent_aspect_h.pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Button(
+            lf_ratio, text="清除固定比例（切回自由）", style="Tool.TButton",
+            command=lambda: self._set_aspect_free()
+        ).pack(fill=tk.X, padx=8, pady=(0, 10))
+
+        # 裁剪分析
+        lf_an = ttk.Labelframe(container, text="裁剪分析（实时）")
+        lf_an.pack(fill=tk.X, padx=0, pady=(0, 10))
+
+        rowan = ttk.Frame(lf_an)
+        rowan.pack(fill=tk.X, padx=8, pady=(10, 6))
+        ttk.Label(rowan, text="比例显示").pack(side=tk.LEFT)
+
+        self.combo_crop_ratio_view = ttk.Combobox(
+            rowan, textvariable=self.crop_ratio_view_mode, state="readonly", width=16,
+            values=("常见比例", "小数(小边=1)")
+        )
+        self.combo_crop_ratio_view.pack(side=tk.LEFT, padx=(8, 0))
+        self.combo_crop_ratio_view.bind("<<ComboboxSelected>>", lambda e: self._update_crop_analysis())
+
+        self.var_an_size = tk.StringVar(value="当前裁剪：-")
+        self.var_an_reduce = tk.StringVar(value="已约分：-")
+        self.var_an_near = tk.StringVar(value="")
+        self.var_an_perfect = tk.StringVar(value="")
+        self.var_an_k = tk.StringVar(value="")
+        self.var_an_decimal = tk.StringVar(value="")
+        self.var_an_multi = tk.StringVar(value="2/4 倍数：-")
+        self.var_an_pow2 = tk.StringVar(value="2 的次幂：-")
+
+        ttk.Label(lf_an, textvariable=self.var_an_size, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=(0, 2))
+        ttk.Label(lf_an, textvariable=self.var_an_reduce, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=(0, 2))
+
+        self.lbl_an_near = ttk.Label(lf_an, textvariable=self.var_an_near, justify=tk.LEFT)
+        self.lbl_an_perfect = ttk.Label(lf_an, textvariable=self.var_an_perfect, justify=tk.LEFT)
+        self.lbl_an_k = ttk.Label(lf_an, textvariable=self.var_an_k, justify=tk.LEFT)
+        self.lbl_an_decimal = ttk.Label(lf_an, textvariable=self.var_an_decimal, justify=tk.LEFT)
+
+        self.lbl_an_near.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        self.lbl_an_perfect.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        self.lbl_an_k.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        self.lbl_an_decimal.pack_forget()
+
+        ttk.Label(lf_an, textvariable=self.var_an_multi, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=(6, 2))
+        ttk.Label(lf_an, textvariable=self.var_an_pow2, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=(0, 10))
+
+        # 底部快捷提示
+        ttk.Label(
+            container,
+            text="提示：主窗口回到前台时，本面板会自动浮上来。\n关闭面板=隐藏，不会销毁。",
+            justify=tk.LEFT
+        ).pack(fill=tk.X, padx=2, pady=(0, 0))
+
+        self._update_crop_analysis()
+
+    def _set_aspect_free(self):
+        try:
+            self.aspect_mode.set("自由")
+        except Exception:
+            pass
+        try:
+            self.aspect_custom_frame.pack_forget()
+        except Exception:
+            pass
+        if self.image and self.crop_box:
+            self._update_crop_overlay()
+
+    def toggle_ratio_window(self):
+        if self._ratio_win_visible:
+            self.hide_ratio_window()
+        else:
+            self.show_ratio_window()
+
+    def show_ratio_window(self):
+        self._create_ratio_window_if_needed()
+        if not (self.ratio_win and self.ratio_win.winfo_exists()):
+            return
+        self._ratio_win_visible = True
+        try:
+            self.ratio_win.deiconify()
+        except Exception:
+            pass
+        self._lift_ratio_window()
+        self._update_crop_analysis()
+
+    def hide_ratio_window(self):
+        if self.ratio_win and self.ratio_win.winfo_exists():
+            try:
+                self.ratio_win.withdraw()
+            except Exception:
+                pass
+        self._ratio_win_visible = False
+        self._return_focus_to_canvas()
+
+    def _lift_ratio_window(self):
+        if not (self.ratio_win and self.ratio_win.winfo_exists()):
+            return
+        if not self._ratio_win_visible:
+            return
+        # 关键：只在主窗口回到前台时把它提上来，不做全局置顶
+        try:
+            self.ratio_win.lift()
+        except Exception:
+            pass
+        try:
+            self.ratio_win.attributes("-topmost", True)
+            self.ratio_win.after(30, lambda: self._safe_unset_topmost())
+        except Exception:
+            pass
+
+    def _safe_unset_topmost(self):
+        if self.ratio_win and self.ratio_win.winfo_exists():
+            try:
+                self.ratio_win.attributes("-topmost", False)
+            except Exception:
+                pass
+
+    def _on_root_focus_in(self, _event=None):
+        self._lift_ratio_window()
+
+    # =========================
+    # Focus：避免“点两下”
+    # =========================
+    def _return_focus_to_canvas(self):
+        try:
+            if self.canvas and self.canvas.winfo_exists():
+                self.canvas.focus_set()
+        except Exception:
+            pass
+
+    # =========================
+    # Canvas 绑定、快捷键等
+    # =========================
     def open_github(self):
         try:
             webbrowser.open_new_tab(self.GITHUB_URL)
@@ -456,9 +944,9 @@ class SnapCrop:
 
         c.bind("<Configure>", lambda e: self._update_status())
 
-        # ===== 修复焦点/空格 bug 的关键绑定 =====
-        c.configure(takefocus=True)  # 允许 Canvas 拿键盘焦点
-        c.bind("<KeyPress-space>", self._on_space_press)     # Space 只在 Canvas 上生效
+        # Space 只在 Canvas 上生效，并在失焦时强制释放
+        c.configure(takefocus=True)
+        c.bind("<KeyPress-space>", self._on_space_press)
         c.bind("<KeyRelease-space>", self._on_space_release)
         c.bind("<FocusOut>", lambda e: self._force_release_space())
 
@@ -486,13 +974,15 @@ class SnapCrop:
         r.bind("<Left>", lambda e: self._on_arrow("Left"))
         r.bind("<Right>", lambda e: self._on_arrow("Right"))
 
+        # 浮窗快捷键
+        r.bind("<F4>", lambda e: self.toggle_ratio_window())
+
     def _set_shift(self, v: bool):
         self.shift_down = v
 
     def _set_ctrl(self, v: bool):
         self.ctrl_down = v
 
-    # ===== 修复焦点/空格 bug：Space 只由 Canvas 处理，并阻断事件继续传播 =====
     def _on_space_press(self, event):
         self.space_down = True
         return "break"
@@ -512,20 +1002,41 @@ class SnapCrop:
             self.btn_apply_resize, self.btn_apply_stretch, self.btn_edge_crop, self.btn_apply_all, self.btn_split,
             self.ent_w, self.ent_h, self.ent_top, self.ent_bottom, self.ent_left, self.ent_right,
             self.combo_split,
-            self.combo_aspect, self.ent_aspect_w, self.ent_aspect_h,
             self.ent_deg, self.btn_rot_apply, self.btn_rot_l, self.btn_rot_r, self.btn_rot_180,
             self.btn_flip_h, self.btn_flip_v,
             self.ent_pad_top, self.ent_pad_bottom, self.ent_pad_left, self.ent_pad_right,
-            self.combo_bg, self.btn_pick_bg, self.btn_expand, self.btn_trim_alpha
+            self.combo_bg, self.btn_pick_bg, self.btn_expand, self.btn_trim_alpha,
+
+            # 分片拉伸
+            self.combo_pw_dir, self.combo_pw_unit, self.chk_pw_link, self.ent_pw_x1, self.ent_pw_x2, self.ent_pw_y1, self.ent_pw_y2,
+            self.btn_piecewise_preview, self.btn_piecewise_clear_preview, self.btn_piecewise,
+
+            # 按尺寸生成裁剪框
+            self.ent_crop_w, self.ent_crop_h, self.btn_crop_by_size,
+
+            # 调色
+            self.scale_bri, self.btn_apply_bri, self.btn_reset_bri,
+            self.scale_white, self.scale_black, self.btn_apply_white, self.btn_apply_black
         ]:
             try:
                 w.configure(state=st)
             except Exception:
                 pass
-        # 注意：详情页里的“打开网页”按钮不依赖图片，不在这里禁用
+
+        # 如果浮窗已创建，把浮窗里的控件也同步禁用/启用
+        if self.ratio_win and self.ratio_win.winfo_exists():
+            for w in [getattr(self, "combo_aspect", None),
+                      getattr(self, "ent_aspect_w", None),
+                      getattr(self, "ent_aspect_h", None),
+                      getattr(self, "combo_crop_ratio_view", None)]:
+                try:
+                    if w:
+                        w.configure(state=st if w != self.combo_aspect else "readonly" if enabled else "disabled")
+                except Exception:
+                    pass
 
     # =========================
-    # Rotate-chain helpers (fix runaway size)
+    # Rotate-chain helpers
     # =========================
     def _reset_rotate_chain(self):
         self._rot_chain_base = None
@@ -539,22 +1050,13 @@ class SnapCrop:
         self._last_op = name
 
     # =========================
-    # 文件命名辅助（用于分割输出：snapcrop_原图名_..._四位随机数.png）
+    # 文件命名辅助（用于分割输出）
     # =========================
     def _safe_stem(self, s: str) -> str:
-        """
-        把原文件名“净化”为更安全的形式（避免空格/符号导致跨平台路径问题）
-        - 允许：字母数字、-、_
-        - 其它字符：替换为 _
-        """
         s = (s or "").strip() or "image"
         return "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in s)
 
     def _base_stem(self) -> str:
-        """
-        优先使用打开图片的文件名（不含扩展名）。
-        如果当前没有 file_path，则回退为 "image"。
-        """
         if getattr(self, "file_path", None):
             return self._safe_stem(os.path.splitext(os.path.basename(self.file_path))[0])
         return "image"
@@ -578,8 +1080,10 @@ class SnapCrop:
                 self.crop_box = self._fit_box_to_ratio_keep_center(self.crop_box, ratio)
                 self._update_crop_overlay()
 
+        self._return_focus_to_canvas()
+
     def _get_selected_ratio(self):
-        m = self.aspect_mode.get()
+        m = getattr(self, "aspect_mode", tk.StringVar(value="自由")).get()
         preset = {
             "1:1": (1, 1),
             "16:9": (16, 9),
@@ -726,6 +1230,7 @@ class SnapCrop:
             self.tk_img = None
             self.canvas_img_id = None
             self._update_status()
+            self._update_crop_analysis()
             return
 
         iw, ih = self.image.size
@@ -767,7 +1272,9 @@ class SnapCrop:
             self.canvas.yview_moveto(top / max(1, h))
 
         self._update_crop_overlay()
+        self._redraw_piecewise_guides()
         self._update_status()
+        self._update_crop_analysis()
 
     def _update_status(self):
         if not self.image:
@@ -788,6 +1295,139 @@ class SnapCrop:
             msg += f"  |  裁剪框：({x1},{y1})-({x2},{y2})  {x2-x1}×{y2-y1}"
 
         self.lbl_status.config(text=msg)
+
+    # =========================
+    # 裁剪分析
+    # =========================
+    def _is_power_of_two(self, n: int) -> bool:
+        return n > 0 and (n & (n - 1)) == 0
+
+    def _best_common_ratio(self, w: int, h: int):
+        if h <= 0 or w <= 0:
+            return None
+        r = w / h
+        best = None
+        for a, b in self.COMMON_RATIOS:
+            if a <= 0 or b <= 0:
+                continue
+            rr = a / b
+            err = abs(r - rr)
+            if best is None or err < best[2] - 1e-12 or (abs(err - best[2]) < 1e-12 and (a + b) < (best[0] + best[1])):
+                best = (a, b, err)
+        return best
+
+    def _update_crop_analysis(self):
+        if not self.image or not self.crop_box:
+            # 如果浮窗还没创建，变量可能还没初始化
+            if not hasattr(self, "var_an_size"):
+                return
+
+            self.var_an_size.set("当前裁剪：-")
+            self.var_an_reduce.set("已约分：-")
+            self.var_an_near.set("")
+            self.var_an_perfect.set("")
+            self.var_an_k.set("")
+            self.var_an_decimal.set("")
+            self.var_an_multi.set("2/4 倍数：-")
+            self.var_an_pow2.set("2 的次幂：-")
+
+            if self.crop_ratio_view_mode.get() == "小数(小边=1)":
+                if hasattr(self, "lbl_an_near") and self.lbl_an_near.winfo_ismapped():
+                    self.lbl_an_near.pack_forget()
+                if hasattr(self, "lbl_an_perfect") and self.lbl_an_perfect.winfo_ismapped():
+                    self.lbl_an_perfect.pack_forget()
+                if hasattr(self, "lbl_an_k") and self.lbl_an_k.winfo_ismapped():
+                    self.lbl_an_k.pack_forget()
+                if hasattr(self, "lbl_an_decimal") and (not self.lbl_an_decimal.winfo_ismapped()):
+                    self.lbl_an_decimal.pack(anchor=tk.W, padx=8, pady=(0, 2))
+            else:
+                if hasattr(self, "lbl_an_decimal") and self.lbl_an_decimal.winfo_ismapped():
+                    self.lbl_an_decimal.pack_forget()
+                if hasattr(self, "lbl_an_near") and (not self.lbl_an_near.winfo_ismapped()):
+                    self.lbl_an_near.pack(anchor=tk.W, padx=8, pady=(0, 2))
+                if hasattr(self, "lbl_an_perfect") and (not self.lbl_an_perfect.winfo_ismapped()):
+                    self.lbl_an_perfect.pack(anchor=tk.W, padx=8, pady=(0, 2))
+                if hasattr(self, "lbl_an_k") and (not self.lbl_an_k.winfo_ismapped()):
+                    self.lbl_an_k.pack(anchor=tk.W, padx=8, pady=(0, 2))
+            return
+
+        if not hasattr(self, "var_an_size"):
+            return
+
+        x1, y1, x2, y2 = self.crop_box
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+
+        self.var_an_size.set(f"当前裁剪：{w}×{h}")
+
+        g = math.gcd(int(w), int(h))
+        rw = int(w) // g
+        rh = int(h) // g
+        self.var_an_reduce.set(f"已约分：{rw}:{rh}（gcd={g}）")
+
+        w2 = (w % 2 == 0)
+        h2 = (h % 2 == 0)
+        w4 = (w % 4 == 0)
+        h4 = (h % 4 == 0)
+        self.var_an_multi.set(
+            f"2/4 倍数：2倍(宽={'是' if w2 else '否'}，高={'是' if h2 else '否'})  |  "
+            f"4倍(宽={'是' if w4 else '否'}，高={'是' if h4 else '否'})"
+        )
+
+        self.var_an_pow2.set(
+            f"2 的次幂：宽={'是' if self._is_power_of_two(w) else '否'}  |  高={'是' if self._is_power_of_two(h) else '否'}"
+        )
+
+        mode = self.crop_ratio_view_mode.get()
+
+        if mode == "小数(小边=1)":
+            small = min(w, h)
+            big = max(w, h)
+            if small <= 0:
+                ratio_s = "-"
+            else:
+                k = big / small
+                ratio_s = f"{k:.3f}:1" if w >= h else f"1:{k:.3f}"
+            self.var_an_decimal.set(f"小数比例(小边=1)：{ratio_s}")
+
+            if self.lbl_an_near.winfo_ismapped():
+                self.lbl_an_near.pack_forget()
+            if self.lbl_an_perfect.winfo_ismapped():
+                self.lbl_an_perfect.pack_forget()
+            if self.lbl_an_k.winfo_ismapped():
+                self.lbl_an_k.pack_forget()
+            if not self.lbl_an_decimal.winfo_ismapped():
+                self.lbl_an_decimal.pack(anchor=tk.W, padx=8, pady=(0, 2))
+            return
+
+        best = self._best_common_ratio(w, h)
+        if not best:
+            self.var_an_near.set("最接近比例：-")
+            self.var_an_perfect.set("最接近完美比例尺寸：-")
+            self.var_an_k.set("约分与比例倍率：-")
+        else:
+            a, b, _err = best
+            gg = math.gcd(a, b)
+            aa, bb = a // gg, b // gg
+            self.var_an_near.set(f"最接近比例：{aa}:{bb}（已约分）")
+
+            kk = int(round((w / a + h / b) / 2.0))
+            kk = max(1, kk)
+            pw = a * kk
+            ph = b * kk
+            dw = pw - w
+            dh = ph - h
+            self.var_an_perfect.set(f"最接近完美比例尺寸：{pw}:{ph}（ΔW={dw:+d}, ΔH={dh:+d}）")
+            self.var_an_k.set(f"约分与比例倍率：{kk}")
+
+        if self.lbl_an_decimal.winfo_ismapped():
+            self.lbl_an_decimal.pack_forget()
+        if not self.lbl_an_near.winfo_ismapped():
+            self.lbl_an_near.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        if not self.lbl_an_perfect.winfo_ismapped():
+            self.lbl_an_perfect.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        if not self.lbl_an_k.winfo_ismapped():
+            self.lbl_an_k.pack(anchor=tk.W, padx=8, pady=(0, 2))
 
     # =========================
     # 打开 / 保存 / Undo / Redo
@@ -813,10 +1453,22 @@ class SnapCrop:
             self.crop_box = None
             self._destroy_crop_items()
 
+            # 清掉分片预览线（避免旧图残留）
+            self.clear_piecewise_guides()
+
             self.ent_w.delete(0, tk.END)
             self.ent_h.delete(0, tk.END)
             self.ent_w.insert(0, str(img.size[0]))
             self.ent_h.insert(0, str(img.size[1]))
+
+            # 按尺寸生成裁剪框：默认给当前尺寸（方便直接改）
+            try:
+                self.ent_crop_w.delete(0, tk.END)
+                self.ent_crop_h.delete(0, tk.END)
+                self.ent_crop_w.insert(0, str(img.size[0]))
+                self.ent_crop_h.insert(0, str(img.size[1]))
+            except Exception:
+                pass
 
             self._checker_cache_size = None
             self._checker_cache_img = None
@@ -825,6 +1477,12 @@ class SnapCrop:
             self._set_ui_enabled(True)
             self._refresh_undo_redo_state()
             self._render_to_canvas()
+
+            # 打开图片后，如果浮窗开着，刷新并浮上
+            if self._ratio_win_visible:
+                self._update_crop_analysis()
+                self._lift_ratio_window()
+
         except Exception as e:
             messagebox.showerror("错误", f"打开失败：{e}")
 
@@ -853,6 +1511,7 @@ class SnapCrop:
             messagebox.showinfo("完成", "保存成功")
         except Exception as e:
             messagebox.showerror("错误", f"保存失败：{e}")
+        self._return_focus_to_canvas()
 
     def _push_undo(self):
         if self.image:
@@ -870,6 +1529,7 @@ class SnapCrop:
         self.redo_stack.append(self.image.copy())
         self.image = self.undo_stack.pop()
         self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
 
     def redo(self):
         if not self.redo_stack or not self.image:
@@ -877,15 +1537,17 @@ class SnapCrop:
         self.undo_stack.append(self.image.copy())
         self.image = self.redo_stack.pop()
         self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
 
     def _after_image_changed(self, op_name="other", keep_center=False):
-        # 任何“非旋转”操作，都终止旋转链
         self._mark_op(op_name)
 
         self.crop_box = None
         self._destroy_crop_items()
         self._checker_cache_size = None
         self._checker_cache_img = None
+
+        self.clear_piecewise_guides()
 
         self.ent_w.delete(0, tk.END)
         self.ent_h.delete(0, tk.END)
@@ -903,6 +1565,8 @@ class SnapCrop:
         else:
             self._render_to_canvas()
 
+        self._return_focus_to_canvas()
+
     # =========================
     # Zoom / Pan
     # =========================
@@ -913,6 +1577,7 @@ class SnapCrop:
         self._checker_cache_size = None
         self._checker_cache_img = None
         self._render_to_canvas()
+        self._return_focus_to_canvas()
 
     def fit_to_view(self):
         if not self.image:
@@ -927,6 +1592,7 @@ class SnapCrop:
         self._checker_cache_size = None
         self._checker_cache_img = None
         self._render_to_canvas()
+        self._return_focus_to_canvas()
 
     def _on_wheel(self, event):
         if not self.image:
@@ -963,7 +1629,7 @@ class SnapCrop:
     def _on_pan_start(self, event):
         if not self.image:
             return
-        self.canvas.focus_set()  # 修复：避免空格触发按钮/输入框
+        self.canvas.focus_set()
         self.canvas.scan_mark(event.x, event.y)
 
     def _on_pan_drag(self, event):
@@ -1027,6 +1693,7 @@ class SnapCrop:
         if not self.image or not self.crop_box:
             self._destroy_crop_items()
             self._update_status()
+            self._update_crop_analysis()
             return
 
         self._ensure_crop_items()
@@ -1041,10 +1708,10 @@ class SnapCrop:
 
         self.canvas.coords(self.crop_rect_id, cx1, cy1, cx2, cy2)
 
-        self.canvas.coords(self.shade_ids[0], 0, 0, w, cy1)      # 上
-        self.canvas.coords(self.shade_ids[1], 0, cy2, w, h)      # 下
-        self.canvas.coords(self.shade_ids[2], 0, cy1, cx1, cy2)  # 左
-        self.canvas.coords(self.shade_ids[3], cx2, cy1, w, cy2)  # 右
+        self.canvas.coords(self.shade_ids[0], 0, 0, w, cy1)
+        self.canvas.coords(self.shade_ids[1], 0, cy2, w, h)
+        self.canvas.coords(self.shade_ids[2], 0, cy1, cx1, cy2)
+        self.canvas.coords(self.shade_ids[3], cx2, cy1, w, cy2)
 
         hs = self.HANDLE_SIZE
         mx = (cx1 + cx2) / 2
@@ -1063,11 +1730,14 @@ class SnapCrop:
         set_handle("se", cx2, cy2)
 
         self._update_status()
+        self._update_crop_analysis()
 
     def clear_crop(self):
         self.crop_box = None
         self._destroy_crop_items()
         self._update_status()
+        self._update_crop_analysis()
+        self._return_focus_to_canvas()
 
     def _hit_test(self, event):
         if not self.crop_box:
@@ -1108,7 +1778,6 @@ class SnapCrop:
     # “专业手感”比例：边拖动中心对称
     # =========================
     def _side_center_symmetric_box(self, cx, cy, handle, ix, iy, ratio):
-        """固定比例 + 拖边：保持中心(cx,cy)，对称改变宽/高（PS风格）"""
         iw, ih = self.image.size
 
         max_half_w = min(cx, iw - cx)
@@ -1139,7 +1808,6 @@ class SnapCrop:
         return self._clamp_box((x1, y1, x2, y2))
 
     def _apply_ratio_resize_corner(self, box, handle, ratio):
-        """角点缩放：保持对角点固定（原有逻辑，够用）"""
         x1, y1, x2, y2 = box
         iw, ih = self.image.size
 
@@ -1207,7 +1875,6 @@ class SnapCrop:
         if not self.image:
             return
 
-        # ===== 修复焦点 bug：只要开始在画布上操作，就把焦点切回 Canvas =====
         self.canvas.focus_set()
 
         cx, cy = self._canvas_xy(event)
@@ -1311,36 +1978,36 @@ class SnapCrop:
             return
 
         if self._drag_mode == "resize":
-            h = self._drag_handle
+            hnd = self._drag_handle
             ratio = self._active_ratio_for_drag(is_new=False)
 
-            if ratio is not None and h in ("n", "s", "e", "w") and self._resize_base_center:
+            if ratio is not None and hnd in ("n", "s", "e", "w") and self._resize_base_center:
                 rcx, rcy = self._resize_base_center
-                self.crop_box = self._side_center_symmetric_box(rcx, rcy, h, ix, iy, ratio)
+                self.crop_box = self._side_center_symmetric_box(rcx, rcy, hnd, ix, iy, ratio)
                 self._update_crop_overlay()
                 self._drag_last = (ix, iy)
                 return
 
-            if h == "nw":
+            if hnd == "nw":
                 x1, y1 = ix, iy
-            elif h == "n":
+            elif hnd == "n":
                 y1 = iy
-            elif h == "ne":
+            elif hnd == "ne":
                 x2, y1 = ix, iy
-            elif h == "w":
+            elif hnd == "w":
                 x1 = ix
-            elif h == "e":
+            elif hnd == "e":
                 x2 = ix
-            elif h == "sw":
+            elif hnd == "sw":
                 x1, y2 = ix, iy
-            elif h == "s":
+            elif hnd == "s":
                 y2 = iy
-            elif h == "se":
+            elif hnd == "se":
                 x2, y2 = ix, iy
 
             box = self._clamp_box((x1, y1, x2, y2))
-            if ratio is not None and h in ("nw", "ne", "sw", "se"):
-                box = self._apply_ratio_resize_corner(box, h, ratio)
+            if ratio is not None and hnd in ("nw", "ne", "sw", "se"):
+                box = self._apply_ratio_resize_corner(box, hnd, ratio)
 
             self.crop_box = box
             self._update_crop_overlay()
@@ -1464,6 +2131,34 @@ class SnapCrop:
             self.crop_box = self._fit_box_to_ratio_keep_center(self.crop_box, ratio)
 
         self._update_crop_overlay()
+        self._return_focus_to_canvas()
+
+    def crop_box_by_size_preview(self):
+        if not self.image:
+            return
+        iw, ih = self.image.size
+        try:
+            cw = int(float(self.ent_crop_w.get()))
+            ch = int(float(self.ent_crop_h.get()))
+        except Exception:
+            messagebox.showerror("错误", "请输入有效的宽高数字（px）")
+            return
+
+        if cw < self.MIN_CROP_SIZE or ch < self.MIN_CROP_SIZE:
+            messagebox.showerror("错误", f"裁剪框宽高不能小于 {self.MIN_CROP_SIZE}px")
+            return
+
+        cw = min(cw, iw)
+        ch = min(ch, ih)
+
+        x1 = int(round((iw - cw) / 2))
+        y1 = int(round((ih - ch) / 2))
+        x2 = x1 + cw
+        y2 = y1 + ch
+
+        self.crop_box = self._clamp_box((x1, y1, x2, y2))
+        self._update_crop_overlay()
+        self._return_focus_to_canvas()
 
     def apply_crop(self):
         if not self.image or not self.crop_box:
@@ -1474,6 +2169,7 @@ class SnapCrop:
         self._push_undo()
         self.image = self.image.crop((x1, y1, x2, y2))
         self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
 
     # =========================
     # 缩放 / 拉伸 / 组合应用
@@ -1506,6 +2202,7 @@ class SnapCrop:
         self._push_undo()
         self.image = self.image.resize((new_w, new_h), Image.Resampling.LANCZOS)
         self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
 
     def apply_stretch(self):
         if not self.image:
@@ -1517,6 +2214,7 @@ class SnapCrop:
         self._push_undo()
         self.image = self.image.resize((new_w, new_h), Image.Resampling.BILINEAR)
         self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
 
     def apply_crop_and_resize(self):
         if not self.image:
@@ -1544,6 +2242,448 @@ class SnapCrop:
             img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
         self.image = img
+        self._after_image_changed(op_name="other")
+        self._return_focus_to_canvas()
+
+    # =========================
+    # 分片拉伸（你原逻辑保留）
+    # =========================
+    def _on_pw_unit_change(self, event=None):
+        u = self.pw_unit.get()
+        if u.startswith("像素"):
+            self.lbl_pw_x.config(text="横向拉伸区域(px)")
+            self.lbl_pw_y.config(text="纵向拉伸区域(px)")
+        else:
+            self.lbl_pw_x.config(text="横向拉伸区域(%)")
+            self.lbl_pw_y.config(text="纵向拉伸区域(%)")
+
+        if self._pw_guides_state is not None:
+            self.preview_piecewise_guides()
+
+    def _read_percent(self, s: str, default: float) -> float:
+        s = (s or "").strip()
+        if not s:
+            return default
+        try:
+            if s.endswith("%"):
+                v = float(s[:-1])
+            else:
+                v = float(s)
+            v = max(0.0, min(100.0, v))
+            return v / 100.0
+        except Exception:
+            return default
+
+    def _read_px(self, s: str, default: int, max_size: int) -> int:
+        s = (s or "").strip().lower()
+        if not s:
+            return max(0, min(int(default), int(max_size)))
+        try:
+            if s.endswith("px"):
+                s = s[:-2].strip()
+            v = int(round(float(s)))
+            return max(0, min(v, int(max_size)))
+        except Exception:
+            return max(0, min(int(default), int(max_size)))
+
+    def _calc_pw_bounds_px(self):
+        if not self.image:
+            raise ValueError("未打开图片")
+        iw, ih = self.image.size
+
+        u = self.pw_unit.get()
+        if u.startswith("像素"):
+            xa = self._read_px(self.ent_pw_x1.get(), int(iw * 0.2), iw)
+            xb = self._read_px(self.ent_pw_x2.get(), int(iw * 0.8), iw)
+            ya = self._read_px(self.ent_pw_y1.get(), int(ih * 0.2), ih)
+            yb = self._read_px(self.ent_pw_y2.get(), int(ih * 0.8), ih)
+        else:
+            x1p = self._read_percent(self.ent_pw_x1.get(), 0.2)
+            x2p = self._read_percent(self.ent_pw_x2.get(), 0.8)
+            y1p = self._read_percent(self.ent_pw_y1.get(), 0.2)
+            y2p = self._read_percent(self.ent_pw_y2.get(), 0.8)
+            xa = int(round(iw * x1p))
+            xb = int(round(iw * x2p))
+            ya = int(round(ih * y1p))
+            yb = int(round(ih * y2p))
+
+        xa = max(0, min(xa, iw))
+        xb = max(0, min(xb, iw))
+        ya = max(0, min(ya, ih))
+        yb = max(0, min(yb, ih))
+
+        if xb <= xa:
+            raise ValueError("横向拉伸区域无效：起点必须小于终点")
+        if yb <= ya:
+            raise ValueError("纵向拉伸区域无效：起点必须小于终点")
+
+        return xa, xb, ya, yb
+
+    def clear_piecewise_guides(self):
+        for i in list(self._pw_guide_ids):
+            try:
+                self.canvas.delete(i)
+            except Exception:
+                pass
+        self._pw_guide_ids = []
+        self._pw_guides_state = None
+
+    def _redraw_piecewise_guides(self):
+        if not self.image or not self._pw_guides_state:
+            if self._pw_guide_ids:
+                for i in list(self._pw_guide_ids):
+                    try:
+                        self.canvas.delete(i)
+                    except Exception:
+                        pass
+                self._pw_guide_ids = []
+            return
+
+        st = self._pw_guides_state
+        mode = st.get("mode")
+        xa = int(st.get("xa", 0))
+        xb = int(st.get("xb", 0))
+        ya = int(st.get("ya", 0))
+        yb = int(st.get("yb", 0))
+
+        iw, ih = self.image.size
+        xa = max(0, min(xa, iw))
+        xb = max(0, min(xb, iw))
+        ya = max(0, min(ya, ih))
+        yb = max(0, min(yb, ih))
+
+        for i in list(self._pw_guide_ids):
+            try:
+                self.canvas.delete(i)
+            except Exception:
+                pass
+        self._pw_guide_ids = []
+
+        w_canvas = int(round(iw * self.scale))
+        h_canvas = int(round(ih * self.scale))
+
+        def vline(x_img):
+            x = self._image_to_canvas(x_img, 0)[0]
+            lid = self.canvas.create_line(x, 0, x, h_canvas, fill=self.ACCENT, dash=(6, 4), width=2, tags=("pw_guides",))
+            self._pw_guide_ids.append(lid)
+
+        def hline(y_img):
+            y = self._image_to_canvas(0, y_img)[1]
+            lid = self.canvas.create_line(0, y, w_canvas, y, fill=self.ACCENT, dash=(6, 4), width=2, tags=("pw_guides",))
+            self._pw_guide_ids.append(lid)
+
+        if mode.startswith("横向"):
+            vline(xa)
+            vline(xb)
+        elif mode.startswith("纵向"):
+            hline(ya)
+            hline(yb)
+        else:
+            vline(xa)
+            vline(xb)
+            hline(ya)
+            hline(yb)
+
+        for i in self._pw_guide_ids:
+            try:
+                self.canvas.tag_raise(i)
+            except Exception:
+                pass
+
+    def preview_piecewise_guides(self):
+        if not self.image:
+            return
+        try:
+            xa, xb, ya, yb = self._calc_pw_bounds_px()
+        except Exception as e:
+            messagebox.showerror("错误", f"预览失败：{e}")
+            return
+
+        mode = self.pw_dir.get()
+        self._pw_guides_state = {"mode": mode, "xa": xa, "xb": xb, "ya": ya, "yb": yb}
+        self._redraw_piecewise_guides()
+        self._return_focus_to_canvas()
+
+    def _piecewise_resize_h_px(self, img: Image.Image, new_w: int, xa: int, xb: int) -> Image.Image:
+        iw, ih = img.size
+        xa = max(0, min(int(xa), iw))
+        xb = max(0, min(int(xb), iw))
+
+        if xb <= xa:
+            raise ValueError("横向拉伸区域无效：起点必须小于终点")
+
+        left_w = xa
+        mid_w = xb - xa
+        right_w = iw - xb
+        new_mid_w = new_w - left_w - right_w
+        if new_mid_w < 1:
+            raise ValueError("目标宽度太小：小于左右保护边缘之和，无法分片拉伸")
+
+        left = img.crop((0, 0, xa, ih))
+        mid = img.crop((xa, 0, xb, ih))
+        right = img.crop((xb, 0, iw, ih))
+
+        mid2 = mid.resize((new_mid_w, ih), Image.Resampling.BILINEAR)
+
+        out = Image.new(img.mode, (new_w, ih))
+        x = 0
+        if left_w > 0:
+            out.paste(left, (x, 0))
+            x += left_w
+        out.paste(mid2, (x, 0))
+        x += new_mid_w
+        if right_w > 0:
+            out.paste(right, (x, 0))
+        return out
+
+    def _piecewise_resize_v_px(self, img: Image.Image, new_h: int, ya: int, yb: int) -> Image.Image:
+        iw, ih = img.size
+        ya = max(0, min(int(ya), ih))
+        yb = max(0, min(int(yb), ih))
+
+        if yb <= ya:
+            raise ValueError("纵向拉伸区域无效：起点必须小于终点")
+
+        top_h = ya
+        mid_h = yb - ya
+        bot_h = ih - yb
+        new_mid_h = new_h - top_h - bot_h
+        if new_mid_h < 1:
+            raise ValueError("目标高度太小：小于上下保护边缘之和，无法分片拉伸")
+
+        top = img.crop((0, 0, iw, ya))
+        mid = img.crop((0, ya, iw, yb))
+        bot = img.crop((0, yb, iw, ih))
+
+        mid2 = mid.resize((iw, new_mid_h), Image.Resampling.BILINEAR)
+
+        out = Image.new(img.mode, (iw, new_h))
+        y = 0
+        if top_h > 0:
+            out.paste(top, (0, y))
+            y += top_h
+        out.paste(mid2, (0, y))
+        y += new_mid_h
+        if bot_h > 0:
+            out.paste(bot, (0, y))
+        return out
+
+    def _nine_slice_resize_px(self, img: Image.Image, new_w: int, new_h: int,
+                              xa: int, xb: int, ya: int, yb: int) -> Image.Image:
+        iw, ih = img.size
+        xa = max(0, min(int(xa), iw))
+        xb = max(0, min(int(xb), iw))
+        ya = max(0, min(int(ya), ih))
+        yb = max(0, min(int(yb), ih))
+
+        if xb <= xa or yb <= ya:
+            raise ValueError("双向拉伸区域无效：横纵起点必须小于终点")
+
+        left_w = xa
+        right_w = iw - xb
+        top_h = ya
+        bot_h = ih - yb
+
+        new_mid_w = new_w - left_w - right_w
+        new_mid_h = new_h - top_h - bot_h
+        if new_mid_w < 1 or new_mid_h < 1:
+            raise ValueError("目标尺寸太小：小于边缘保护尺寸之和，无法九宫格拉伸")
+
+        TL = img.crop((0, 0, xa, ya))
+        TM = img.crop((xa, 0, xb, ya))
+        TR = img.crop((xb, 0, iw, ya))
+
+        ML = img.crop((0, ya, xa, yb))
+        MM = img.crop((xa, ya, xb, yb))
+        MR = img.crop((xb, ya, iw, yb))
+
+        BL = img.crop((0, yb, xa, ih))
+        BM = img.crop((xa, yb, xb, ih))
+        BR = img.crop((xb, yb, iw, ih))
+
+        TM2 = TM.resize((new_mid_w, top_h), Image.Resampling.BILINEAR) if top_h > 0 else TM
+        BM2 = BM.resize((new_mid_w, bot_h), Image.Resampling.BILINEAR) if bot_h > 0 else BM
+        ML2 = ML.resize((left_w, new_mid_h), Image.Resampling.BILINEAR) if left_w > 0 else ML
+        MR2 = MR.resize((right_w, new_mid_h), Image.Resampling.BILINEAR) if right_w > 0 else MR
+        MM2 = MM.resize((new_mid_w, new_mid_h), Image.Resampling.BILINEAR)
+
+        out = Image.new(img.mode, (new_w, new_h))
+
+        xL = 0
+        xM = left_w
+        xR = left_w + new_mid_w
+
+        yT = 0
+        yM = top_h
+        yB = top_h + new_mid_h
+
+        if left_w > 0 and top_h > 0:
+            out.paste(TL, (xL, yT))
+        if top_h > 0:
+            out.paste(TM2, (xM, yT))
+        if right_w > 0 and top_h > 0:
+            out.paste(TR, (xR, yT))
+
+        if left_w > 0:
+            out.paste(ML2, (xL, yM))
+        out.paste(MM2, (xM, yM))
+        if right_w > 0:
+            out.paste(MR2, (xR, yM))
+
+        if left_w > 0 and bot_h > 0:
+            out.paste(BL, (xL, yB))
+        if bot_h > 0:
+            out.paste(BM2, (xM, yB))
+        if right_w > 0 and bot_h > 0:
+            out.paste(BR, (xR, yB))
+
+        return out
+
+    def apply_piecewise_stretch(self):
+        if not self.image:
+            return
+
+        wh = self._read_wh()
+        if not wh:
+            return
+        target_w, target_h = wh
+
+        mode = self.pw_dir.get()
+        img0 = self.image
+        base_mode = img0.mode
+
+        try:
+            xa, xb, ya, yb = self._calc_pw_bounds_px()
+
+            self._push_undo()
+
+            if mode.startswith("横向"):
+                out = self._piecewise_resize_h_px(img0, target_w, xa, xb)
+                if self.pw_link_other.get():
+                    out = out.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+            elif mode.startswith("纵向"):
+                out = self._piecewise_resize_v_px(img0, target_h, ya, yb)
+                if self.pw_link_other.get():
+                    out = out.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+            else:
+                out = self._nine_slice_resize_px(img0, target_w, target_h, xa, xb, ya, yb)
+
+            if out.mode != base_mode:
+                out = out.convert(base_mode)
+
+            self.image = out
+            self._after_image_changed(op_name="other")
+
+        except Exception as e:
+            try:
+                if self.undo_stack:
+                    self.undo_stack.pop()
+            except Exception:
+                pass
+            self._refresh_undo_redo_state()
+            messagebox.showerror("错误", f"分片拉伸失败：{e}")
+
+        self._return_focus_to_canvas()
+
+    # =========================
+    # 调色
+    # =========================
+    def _ensure_rgb_alpha(self, img: Image.Image):
+        if img.mode == "RGBA":
+            r, g, b, a = img.split()
+            rgb = Image.merge("RGB", (r, g, b))
+            return rgb, a
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img, None
+
+    def _merge_rgb_alpha(self, rgb: Image.Image, alpha, base_mode: str):
+        if alpha is None:
+            return rgb if base_mode == "RGB" else rgb.convert(base_mode)
+        rgba = Image.merge("RGBA", (*rgb.split(), alpha))
+        return rgba
+
+    def _apply_rgb_keep_alpha(self, func_rgb):
+        if not self.image:
+            return None
+        base_mode = self.image.mode
+        rgb, alpha = self._ensure_rgb_alpha(self.image)
+        rgb2 = func_rgb(rgb)
+        return self._merge_rgb_alpha(rgb2, alpha, base_mode)
+
+    def apply_brightness(self):
+        if not self.image:
+            return
+        try:
+            k = float(self.var_brightness.get())
+        except Exception:
+            messagebox.showerror("错误", "亮度系数无效")
+            return
+
+        if k <= 0:
+            messagebox.showerror("错误", "亮度系数必须 > 0")
+            return
+
+        self._push_undo()
+
+        def _do(rgb):
+            enh = ImageEnhance.Brightness(rgb)
+            return enh.enhance(k)
+
+        out = self._apply_rgb_keep_alpha(_do)
+        if out is None:
+            return
+        self.image = out
+        self._after_image_changed(op_name="other")
+
+    def apply_whiten(self):
+        if not self.image:
+            return
+        try:
+            t = float(self.var_white.get()) / 100.0
+        except Exception:
+            t = 0.0
+        t = max(0.0, min(1.0, t))
+
+        if t <= 0:
+            return
+
+        self._push_undo()
+
+        def _do(rgb):
+            white = Image.new("RGB", rgb.size, (255, 255, 255))
+            return Image.blend(rgb, white, t)
+
+        out = self._apply_rgb_keep_alpha(_do)
+        if out is None:
+            return
+        self.image = out
+        self._after_image_changed(op_name="other")
+
+    def apply_blacken(self):
+        if not self.image:
+            return
+        try:
+            t = float(self.var_black.get()) / 100.0
+        except Exception:
+            t = 0.0
+        t = max(0.0, min(1.0, t))
+
+        if t <= 0:
+            return
+
+        self._push_undo()
+
+        def _do(rgb):
+            black = Image.new("RGB", rgb.size, (0, 0, 0))
+            return Image.blend(rgb, black, t)
+
+        out = self._apply_rgb_keep_alpha(_do)
+        if out is None:
+            return
+        self.image = out
         self._after_image_changed(op_name="other")
 
     # =========================
@@ -1608,6 +2748,7 @@ class SnapCrop:
         ch = max(1, self.canvas.winfo_height())
         nw, nh = self.image.size
         self._render_to_canvas(keep_view_point=(nw / 2, nh / 2, cw / 2, ch / 2))
+        self._return_focus_to_canvas()
 
     def rotate_by_entry(self):
         if not self.image:
@@ -1620,6 +2761,7 @@ class SnapCrop:
         if abs(deg) < 1e-9:
             return
         self._rotate_accumulated(deg)
+        self._return_focus_to_canvas()
 
     # =========================
     # 翻转
@@ -1741,16 +2883,9 @@ class SnapCrop:
             self.custom_split.pack_forget()
 
     def split_image(self):
-        """
-        分割并保存：
-        - 文件名格式：snapcrop_<原图名>_r1_c1_1234.png
-        - 同一次分割使用同一个 4 位随机数 run_id（更整齐）
-        - 下一次分割 run_id 会变，避免覆盖同名文件
-        """
         if not self.image:
             return
 
-        # 1) 读分割模式
         mode = self.split_mode.get()
         if mode == "4等分（2×2）":
             rows, cols = 2, 2
@@ -1768,27 +2903,22 @@ class SnapCrop:
                 messagebox.showerror("错误", "自定义行列必须是 > 0 的数字")
                 return
 
-        # 2) 选择输出目录
         out_dir = filedialog.askdirectory(title="选择保存目录")
         if not out_dir:
             return
 
-        # 3) 生成本次分割的“基础名”和 4 位随机后缀
         stem = self._base_stem()
 
-        # 生成 run_id：尽量避免极小概率碰撞（同目录已有同名文件时就再随机一次）
         run_id = None
         for _ in range(50):
-            cand = f"{secrets.randbelow(10000):04d}"  # 0000~9999
+            cand = f"{secrets.randbelow(10000):04d}"
             test_path = os.path.join(out_dir, f"snapcrop_{stem}_r1_c1_{cand}.png")
             if not os.path.exists(test_path):
                 run_id = cand
                 break
         if run_id is None:
-            # 理论上非常难到这里；作为兜底，直接用一个随机值
             run_id = f"{secrets.randbelow(10000):04d}"
 
-        # 4) 计算每块尺寸并保存
         iw, ih = self.image.size
         w_per = iw // cols
         h_per = ih // rows
@@ -1803,12 +2933,12 @@ class SnapCrop:
 
                 piece = self.image.crop((x1, y1, x2, y2))
 
-                # 文件名：snapcrop_原图名_rX_cY_1234.png
                 name = f"snapcrop_{stem}_r{r+1}_c{c+1}_{run_id}.png"
                 piece.save(os.path.join(out_dir, name), optimize=True)
                 count += 1
 
         messagebox.showinfo("完成", f"已生成 {count} 张图片")
+        self._return_focus_to_canvas()
 
     # =========================
     # 运行
